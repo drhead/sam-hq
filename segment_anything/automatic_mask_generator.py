@@ -14,18 +14,15 @@ from .modeling import Sam
 from .predictor import SamPredictor
 from .utils.amg import (
     MaskData,
-    area_from_rle,
     batch_iterator,
     batched_mask_to_box,
     box_xyxy_to_xywh,
     build_all_layer_point_grids,
     calculate_stability_score,
-    coco_encode_rle,
     generate_crop_boxes,
     is_box_near_crop_edge,
-    mask_to_rle_pytorch,
+    masks_to_tensor_list,
     remove_small_regions,
-    rle_to_mask,
     uncrop_boxes_xyxy,
     uncrop_masks,
     uncrop_points,
@@ -48,7 +45,6 @@ class SamAutomaticMaskGenerator:
         crop_n_points_downscale_factor: int = 1,
         point_grids: Optional[List[np.ndarray]] = None,
         min_mask_region_area: int = 0,
-        output_mode: str = "binary_mask",
     ) -> None:
         """
         Using a SAM model, generates masks for the entire image.
@@ -89,10 +85,6 @@ class SamAutomaticMaskGenerator:
           min_mask_region_area (int): If >0, postprocessing will be applied
             to remove disconnected regions and holes in masks with area smaller
             than min_mask_region_area. Requires opencv.
-          output_mode (str): The form masks are returned in. Can be 'binary_mask',
-            'uncompressed_rle', or 'coco_rle'. 'coco_rle' requires pycocotools.
-            For large resolutions, 'binary_mask' may consume large amounts of
-            memory.
         """
 
         assert (points_per_side is None) != (
@@ -109,14 +101,6 @@ class SamAutomaticMaskGenerator:
         else:
             raise ValueError("Can't have both points_per_side and point_grid be None.")
 
-        assert output_mode in [
-            "binary_mask",
-            "uncompressed_rle",
-            "coco_rle",
-        ], f"Unknown output_mode {output_mode}."
-        if output_mode == "coco_rle":
-            from pycocotools import mask as mask_utils  # type: ignore # noqa: F401
-
         if min_mask_region_area > 0:
             import cv2  # type: ignore # noqa: F401
 
@@ -131,7 +115,6 @@ class SamAutomaticMaskGenerator:
         self.crop_overlap_ratio = crop_overlap_ratio
         self.crop_n_points_downscale_factor = crop_n_points_downscale_factor
         self.min_mask_region_area = min_mask_region_area
-        self.output_mode = output_mode
 
     @torch.no_grad()
     def generate(self, image: np.ndarray, multimask_output: bool = True) -> List[Dict[str, Any]]:
@@ -164,26 +147,19 @@ class SamAutomaticMaskGenerator:
 
         # Filter small disconnected regions and holes in masks
         if self.min_mask_region_area > 0:
-            mask_data = self.postprocess_small_regions(
-                mask_data,
-                self.min_mask_region_area,
-                max(self.box_nms_thresh, self.crop_nms_thresh),
-            )
-
-        # Encode masks
-        if self.output_mode == "coco_rle":
-            mask_data["segmentations"] = [coco_encode_rle(rle) for rle in mask_data["rles"]]
-        elif self.output_mode == "binary_mask":
-            mask_data["segmentations"] = [rle_to_mask(rle) for rle in mask_data["rles"]]
-        else:
-            mask_data["segmentations"] = mask_data["rles"]
+            print("WARN: Skipping postprocessing (bypassed pending refactor)")
+            # mask_data = self.postprocess_small_regions(
+            #     mask_data,
+            #     self.min_mask_region_area,
+            #     max(self.box_nms_thresh, self.crop_nms_thresh),
+            # )
 
         # Write mask records
         curr_anns = []
         for idx in range(len(mask_data["segmentations"])):
             ann = {
                 "segmentation": mask_data["segmentations"][idx],
-                "area": area_from_rle(mask_data["rles"][idx]),
+                "area": torch.count_nonzero(mask_data["segmentations"][idx]),
                 "bbox": box_xyxy_to_xywh(mask_data["boxes"][idx]).tolist(),
                 "predicted_iou": mask_data["iou_preds"][idx].item(),
                 "point_coords": [mask_data["points"][idx].tolist()],
@@ -260,7 +236,7 @@ class SamAutomaticMaskGenerator:
         # Return to the original image frame
         data["boxes"] = uncrop_boxes_xyxy(data["boxes"], crop_box)
         data["points"] = uncrop_points(data["points"], crop_box)
-        data["crop_boxes"] = torch.tensor([crop_box for _ in range(len(data["rles"]))])
+        data["crop_boxes"] = torch.tensor([crop_box for _ in range(len(data["segmentations"]))])
 
         return data
 
@@ -317,58 +293,58 @@ class SamAutomaticMaskGenerator:
 
         # Compress to RLE
         data["masks"] = uncrop_masks(data["masks"], crop_box, orig_h, orig_w)
-        data["rles"] = mask_to_rle_pytorch(data["masks"])
+        data["segmentations"] = masks_to_tensor_list(data["masks"])
         del data["masks"]
 
         return data
 
-    @staticmethod
-    def postprocess_small_regions(
-        mask_data: MaskData, min_area: int, nms_thresh: float
-    ) -> MaskData:
-        """
-        Removes small disconnected regions and holes in masks, then reruns
-        box NMS to remove any new duplicates.
+    # @staticmethod
+    # def postprocess_small_regions(
+    #     mask_data: MaskData, min_area: int, nms_thresh: float
+    # ) -> MaskData:
+    #     """
+    #     Removes small disconnected regions and holes in masks, then reruns
+    #     box NMS to remove any new duplicates.
 
-        Edits mask_data in place.
+    #     Edits mask_data in place.
 
-        Requires open-cv as a dependency.
-        """
-        if len(mask_data["rles"]) == 0:
-            return mask_data
+    #     Requires open-cv as a dependency.
+    #     """
+    #     if len(mask_data["rles"]) == 0:
+    #         return mask_data
 
-        # Filter small disconnected regions and holes
-        new_masks = []
-        scores = []
-        for rle in mask_data["rles"]:
-            mask = rle_to_mask(rle)
+    #     # Filter small disconnected regions and holes
+    #     new_masks = []
+    #     scores = []
+    #     for rle in mask_data["rles"]:
+    #         mask = rle_to_mask(rle)
 
-            mask, changed = remove_small_regions(mask, min_area, mode="holes")
-            unchanged = not changed
-            mask, changed = remove_small_regions(mask, min_area, mode="islands")
-            unchanged = unchanged and not changed
+    #         mask, changed = remove_small_regions(mask, min_area, mode="holes")
+    #         unchanged = not changed
+    #         mask, changed = remove_small_regions(mask, min_area, mode="islands")
+    #         unchanged = unchanged and not changed
 
-            new_masks.append(torch.as_tensor(mask).unsqueeze(0))
-            # Give score=0 to changed masks and score=1 to unchanged masks
-            # so NMS will prefer ones that didn't need postprocessing
-            scores.append(float(unchanged))
+    #         new_masks.append(torch.as_tensor(mask).unsqueeze(0))
+    #         # Give score=0 to changed masks and score=1 to unchanged masks
+    #         # so NMS will prefer ones that didn't need postprocessing
+    #         scores.append(float(unchanged))
 
-        # Recalculate boxes and remove any new duplicates
-        masks = torch.cat(new_masks, dim=0)
-        boxes = batched_mask_to_box(masks)
-        keep_by_nms = batched_nms(
-            boxes.float(),
-            torch.as_tensor(scores),
-            torch.zeros_like(boxes[:, 0]),  # categories
-            iou_threshold=nms_thresh,
-        )
+    #     # Recalculate boxes and remove any new duplicates
+    #     masks = torch.cat(new_masks, dim=0)
+    #     boxes = batched_mask_to_box(masks)
+    #     keep_by_nms = batched_nms(
+    #         boxes.float(),
+    #         torch.as_tensor(scores),
+    #         torch.zeros_like(boxes[:, 0]),  # categories
+    #         iou_threshold=nms_thresh,
+    #     )
 
-        # Only recalculate RLEs for masks that have changed
-        for i_mask in keep_by_nms:
-            if scores[i_mask] == 0.0:
-                mask_torch = masks[i_mask].unsqueeze(0)
-                mask_data["rles"][i_mask] = mask_to_rle_pytorch(mask_torch)[0]
-                mask_data["boxes"][i_mask] = boxes[i_mask]  # update res directly
-        mask_data.filter(keep_by_nms)
+    #     # Only recalculate RLEs for masks that have changed
+    #     for i_mask in keep_by_nms:
+    #         if scores[i_mask] == 0.0:
+    #             mask_torch = masks[i_mask].unsqueeze(0)
+    #             mask_data["rles"][i_mask] = mask_to_rle_pytorch(mask_torch)[0]
+    #             mask_data["boxes"][i_mask] = boxes[i_mask]  # update res directly
+    #     mask_data.filter(keep_by_nms)
 
-        return mask_data
+    #     return mask_data

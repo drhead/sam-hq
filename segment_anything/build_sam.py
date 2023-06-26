@@ -69,7 +69,7 @@ def _build_sam(
             embed_dim=encoder_embed_dim,
             img_size=image_size,
             mlp_ratio=4,
-            norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+            norm_layer=partial(torch.nn.LayerNorm, eps=1e-6), # type: ignore
             num_heads=encoder_num_heads,
             patch_size=vit_patch_size,
             qkv_bias=True,
@@ -96,7 +96,7 @@ def _build_sam(
             iou_head_depth=3,
             iou_head_hidden_dim=256,
             vit_dim=encoder_embed_dim,
-        ),
+        ), # type: ignore
         pixel_mean=[123.675, 116.28, 103.53],
         pixel_std=[58.395, 57.12, 57.375],
     )
