@@ -278,13 +278,13 @@ class SamAutomaticMaskGenerator:
             iou_preds=iou_preds.flatten(0, 1),
             points=torch.as_tensor(points.repeat(masks.shape[1], axis=0)),
         )
+        keep_mask = torch.ones(masks.shape[0], dtype=torch.bool, device=masks.device)
         del masks
 
         # Filter by predicted IoU
         with xp.Trace('filter_iou'):
             if self.pred_iou_thresh > 0.0:
-                keep_mask = data["iou_preds"] > self.pred_iou_thresh
-                data.filter(keep_mask)
+                keep_mask = torch.logical_and(keep_mask, torch.as_tensor(data["iou_preds"] > self.pred_iou_thresh))
 
         # Calculate stability score
         with xp.Trace('filter_stab'):
@@ -292,8 +292,7 @@ class SamAutomaticMaskGenerator:
                 data["masks"], self.predictor.model.mask_threshold, self.stability_score_offset
             )
             if self.stability_score_thresh > 0.0:
-                keep_mask = data["stability_score"] >= self.stability_score_thresh
-                data.filter(keep_mask)
+                keep_mask = torch.logical_and(keep_mask, torch.as_tensor(data["stability_score"] >= self.stability_score_thresh))
 
         # Threshold masks and calculate boxes
         with xp.Trace('threshold_box'):
@@ -302,15 +301,14 @@ class SamAutomaticMaskGenerator:
 
         # Filter boxes that touch crop boundaries
         with xp.Trace('crop_bounds'):
-            keep_mask = ~is_box_near_crop_edge(data["boxes"], crop_box, [0, 0, orig_w, orig_h])
-            if not torch.all(keep_mask):
-                data.filter(keep_mask)
+            keep_mask = torch.logical_and(keep_mask, torch.as_tensor(~is_box_near_crop_edge(data["boxes"], crop_box, [0, 0, orig_w, orig_h])))
 
         # Compress to RLE
         with xp.Trace('uncrop_masks'):
             data["masks"] = uncrop_masks(data["masks"], crop_box, orig_h, orig_w)
             data["segmentations"] = masks_to_tensor_list(data["masks"])
             del data["masks"]
+        data.filter(keep_mask)
 
         return data
 
