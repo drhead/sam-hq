@@ -195,13 +195,14 @@ class SamAutomaticMaskGenerator:
                 # Prefer masks from smaller crops
                 scores = 1 / box_area(data["crop_boxes"])
                 scores = scores.to(data["boxes"].device)
-                keep_by_nms = batched_nms(
+                keep_by_nms, num_kept = xf.nms(
                     data["boxes"].float(),
                     scores,
-                    torch.zeros_like(data["boxes"][:, 0]),  # categories
+                    score_threshold = torch.tensor(0, dtype=torch.float, device = xm.xla_device()),
                     iou_threshold=self.crop_nms_thresh,
+                    output_size = data["boxes"].shape[0]
                 )
-                data.filter(keep_by_nms)
+                data.filter(keep_by_nms[:num_kept])
         # with xp.Trace('data_to_numpy'):
             # data.to_numpy()
         return data
