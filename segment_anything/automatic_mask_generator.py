@@ -7,6 +7,7 @@
 import numpy as np
 import torch
 from torchvision.ops.boxes import batched_nms, box_area  # type: ignore
+import torch_xla.debug.profiler as xp
 
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -143,7 +144,8 @@ class SamAutomaticMaskGenerator:
         """
 
         # Generate masks
-        mask_data = self._generate_masks(image, multimask_output)
+        with xp.Trace('generate_masks'):
+            mask_data = self._generate_masks(image, multimask_output)
 
         # Filter small disconnected regions and holes in masks
         if self.min_mask_region_area > 0:
@@ -156,17 +158,18 @@ class SamAutomaticMaskGenerator:
 
         # Write mask records
         curr_anns = []
-        for idx in range(len(mask_data["segmentations"])):
-            ann = {
-                "segmentation": mask_data["segmentations"][idx],
-                "area": torch.count_nonzero(mask_data["segmentations"][idx]),
-                "bbox": box_xyxy_to_xywh(mask_data["boxes"][idx]).tolist(),
-                "predicted_iou": mask_data["iou_preds"][idx].item(),
-                "point_coords": [mask_data["points"][idx].tolist()],
-                "stability_score": mask_data["stability_score"][idx].item(),
-                "crop_box": box_xyxy_to_xywh(mask_data["crop_boxes"][idx]).tolist(),
-            }
-            curr_anns.append(ann)
+        with xp.Trace('data_export'):
+            for idx in range(len(mask_data["segmentations"])):
+                ann = {
+                    "segmentation": mask_data["segmentations"][idx],
+                    "area": torch.count_nonzero(mask_data["segmentations"][idx]),
+                    "bbox": box_xyxy_to_xywh(mask_data["boxes"][idx]).tolist(),
+                    "predicted_iou": mask_data["iou_preds"][idx].item(),
+                    "point_coords": [mask_data["points"][idx].tolist()],
+                    "stability_score": mask_data["stability_score"][idx].item(),
+                    "crop_box": box_xyxy_to_xywh(mask_data["crop_boxes"][idx]).tolist(),
+                }
+                curr_anns.append(ann)
 
         return curr_anns
 
@@ -178,24 +181,27 @@ class SamAutomaticMaskGenerator:
 
         # Iterate over image crops
         data = MaskData()
-        for crop_box, layer_idx in zip(crop_boxes, layer_idxs):
-            crop_data = self._process_crop(image, crop_box, layer_idx, orig_size, multimask_output)
-            data.cat(crop_data)
+        with xp.Trace('iterate_crops'):
+            for crop_box, layer_idx in zip(crop_boxes, layer_idxs):
+                with xp.Trace('process_crop'):
+                    crop_data = self._process_crop(image, crop_box, layer_idx, orig_size, multimask_output)
+                    data.cat(crop_data)
 
         # Remove duplicate masks between crops
-        if len(crop_boxes) > 1:
-            # Prefer masks from smaller crops
-            scores = 1 / box_area(data["crop_boxes"])
-            scores = scores.to(data["boxes"].device)
-            keep_by_nms = batched_nms(
-                data["boxes"].float(),
-                scores,
-                torch.zeros_like(data["boxes"][:, 0]),  # categories
-                iou_threshold=self.crop_nms_thresh,
-            )
-            data.filter(keep_by_nms)
-
-        data.to_numpy()
+        with xp.Trace('dedup_crops'):
+            if len(crop_boxes) > 1:
+                # Prefer masks from smaller crops
+                scores = 1 / box_area(data["crop_boxes"])
+                scores = scores.to(data["boxes"].device)
+                keep_by_nms = batched_nms(
+                    data["boxes"].float(),
+                    scores,
+                    torch.zeros_like(data["boxes"][:, 0]),  # categories
+                    iou_threshold=self.crop_nms_thresh,
+                )
+                data.filter(keep_by_nms)
+        with xp.Trace('data_to_numpy'):
+            data.to_numpy()
         return data
 
     def _process_crop(
@@ -206,37 +212,41 @@ class SamAutomaticMaskGenerator:
         orig_size: Tuple[int, ...],
         multimask_output: bool = True,
     ) -> MaskData:
-        # Crop the image and calculate embeddings
-        x0, y0, x1, y1 = crop_box
-        cropped_im = image[y0:y1, x0:x1, :]
-        cropped_im_size = cropped_im.shape[:2]
-        self.predictor.set_image(cropped_im)
+        with xp.Trace('crop_image'):
+            # Crop the image and calculate embeddings
+            x0, y0, x1, y1 = crop_box
+            cropped_im = image[y0:y1, x0:x1, :]
+            cropped_im_size = cropped_im.shape[:2]
+            self.predictor.set_image(cropped_im)
 
-        # Get points for this crop
-        points_scale = np.array(cropped_im_size)[None, ::-1]
-        points_for_image = self.point_grids[crop_layer_idx] * points_scale
+            # Get points for this crop
+            points_scale = np.array(cropped_im_size)[None, ::-1]
+            points_for_image = self.point_grids[crop_layer_idx] * points_scale
 
         # Generate masks for this crop in batches
         data = MaskData()
-        for (points,) in batch_iterator(self.points_per_batch, points_for_image):
-            batch_data = self._process_batch(points, cropped_im_size, crop_box, orig_size, multimask_output)
-            data.cat(batch_data)
-            del batch_data
-        self.predictor.reset_image()
+        with xp.Trace('process_batches'):
+            for (points,) in batch_iterator(self.points_per_batch, points_for_image):
+                batch_data = self._process_batch(points, cropped_im_size, crop_box, orig_size, multimask_output)
+                data.cat(batch_data)
+                del batch_data
+            self.predictor.reset_image()
 
         # Remove duplicates within this crop.
-        keep_by_nms = batched_nms(
-            data["boxes"].float(),
-            data["iou_preds"],
-            torch.zeros_like(data["boxes"][:, 0]),  # categories
-            iou_threshold=self.box_nms_thresh,
-        )
-        data.filter(keep_by_nms)
+        with xp.Trace('batched_nms'):
+            keep_by_nms = batched_nms(
+                data["boxes"].float(),
+                data["iou_preds"],
+                torch.zeros_like(data["boxes"][:, 0]),  # categories
+                iou_threshold=self.box_nms_thresh,
+            )
+            data.filter(keep_by_nms)
 
         # Return to the original image frame
-        data["boxes"] = uncrop_boxes_xyxy(data["boxes"], crop_box)
-        data["points"] = uncrop_points(data["points"], crop_box)
-        data["crop_boxes"] = torch.tensor([crop_box for _ in range(len(data["segmentations"]))])
+        with xp.Trace('uncrop_boxes'):
+            data["boxes"] = uncrop_boxes_xyxy(data["boxes"], crop_box)
+            data["points"] = uncrop_points(data["points"], crop_box)
+            data["crop_boxes"] = torch.tensor([crop_box for _ in range(len(data["segmentations"]))])
 
         return data
 
@@ -254,12 +264,13 @@ class SamAutomaticMaskGenerator:
         transformed_points = self.predictor.transform.apply_coords(points, im_size)
         in_points = torch.as_tensor(transformed_points, device=self.predictor.device)
         in_labels = torch.ones(in_points.shape[0], dtype=torch.int, device=in_points.device)
-        masks, iou_preds, _ = self.predictor.predict_torch(
-            in_points[:, None, :],
-            in_labels[:, None],
-            multimask_output=multimask_output,
-            return_logits=True,
-        )
+        with xp.Trace('predict_torch'):
+            masks, iou_preds, _ = self.predictor.predict_torch(
+                in_points[:, None, :],
+                in_labels[:, None],
+                multimask_output=multimask_output,
+                return_logits=True,
+            )
 
         # Serialize predictions and store in MaskData
         data = MaskData(
@@ -270,31 +281,36 @@ class SamAutomaticMaskGenerator:
         del masks
 
         # Filter by predicted IoU
-        if self.pred_iou_thresh > 0.0:
-            keep_mask = data["iou_preds"] > self.pred_iou_thresh
-            data.filter(keep_mask)
+        with xp.Trace('filter_iou'):
+            if self.pred_iou_thresh > 0.0:
+                keep_mask = data["iou_preds"] > self.pred_iou_thresh
+                data.filter(keep_mask)
 
         # Calculate stability score
-        data["stability_score"] = calculate_stability_score(
-            data["masks"], self.predictor.model.mask_threshold, self.stability_score_offset
-        )
-        if self.stability_score_thresh > 0.0:
-            keep_mask = data["stability_score"] >= self.stability_score_thresh
-            data.filter(keep_mask)
+        with xp.Trace('filter_stab'):
+            data["stability_score"] = calculate_stability_score(
+                data["masks"], self.predictor.model.mask_threshold, self.stability_score_offset
+            )
+            if self.stability_score_thresh > 0.0:
+                keep_mask = data["stability_score"] >= self.stability_score_thresh
+                data.filter(keep_mask)
 
         # Threshold masks and calculate boxes
-        data["masks"] = data["masks"] > self.predictor.model.mask_threshold
-        data["boxes"] = batched_mask_to_box(data["masks"])
+        with xp.Trace('threshold_box'):
+            data["masks"] = data["masks"] > self.predictor.model.mask_threshold
+            data["boxes"] = batched_mask_to_box(data["masks"])
 
         # Filter boxes that touch crop boundaries
-        keep_mask = ~is_box_near_crop_edge(data["boxes"], crop_box, [0, 0, orig_w, orig_h])
-        if not torch.all(keep_mask):
-            data.filter(keep_mask)
+        with xp.Trace('crop_bounds'):
+            keep_mask = ~is_box_near_crop_edge(data["boxes"], crop_box, [0, 0, orig_w, orig_h])
+            if not torch.all(keep_mask):
+                data.filter(keep_mask)
 
         # Compress to RLE
-        data["masks"] = uncrop_masks(data["masks"], crop_box, orig_h, orig_w)
-        data["segmentations"] = masks_to_tensor_list(data["masks"])
-        del data["masks"]
+        with xp.Trace('uncrop_masks'):
+            data["masks"] = uncrop_masks(data["masks"], crop_box, orig_h, orig_w)
+            data["segmentations"] = masks_to_tensor_list(data["masks"])
+            del data["masks"]
 
         return data
 

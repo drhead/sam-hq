@@ -6,6 +6,7 @@
 
 import numpy as np
 import torch
+import torch_xla.debug.profiler as xp
 
 import math
 from copy import deepcopy
@@ -42,19 +43,20 @@ class MaskData:
         return self._stats.items()
 
     def filter(self, keep: torch.Tensor) -> None:
-        for k, v in self._stats.items():
-            if v is None:
-                self._stats[k] = None
-            elif isinstance(v, torch.Tensor):
-                self._stats[k] = v[torch.as_tensor(keep, device=v.device)]
-            elif isinstance(v, np.ndarray):
-                self._stats[k] = v[keep.detach().cpu().numpy()]
-            elif isinstance(v, list) and keep.dtype == torch.bool:
-                self._stats[k] = [a for i, a in enumerate(v) if keep[i]]
-            elif isinstance(v, list):
-                self._stats[k] = [v[i] for i in keep]
-            else:
-                raise TypeError(f"MaskData key {k} has an unsupported type {type(v)}.")
+        with xp.Trace('maskdata_filter'):
+            for k, v in self._stats.items():
+                if v is None:
+                    self._stats[k] = None
+                elif isinstance(v, torch.Tensor):
+                    self._stats[k] = v[torch.as_tensor(keep, device=v.device)]
+                elif isinstance(v, np.ndarray):
+                    self._stats[k] = v[keep.detach().cpu().numpy()]
+                elif isinstance(v, list) and keep.dtype == torch.bool:
+                    self._stats[k] = [a for i, a in enumerate(v) if keep[i]]
+                elif isinstance(v, list):
+                    self._stats[k] = [v[i] for i in keep]
+                else:
+                    raise TypeError(f"MaskData key {k} has an unsupported type {type(v)}.")
 
     def cat(self, new_stats: "MaskData") -> None:
         for k, v in new_stats.items():
@@ -105,10 +107,11 @@ def batch_iterator(batch_size: int, *args) -> Generator[List[Any], None, None]:
 
 
 def masks_to_tensor_list(tensor: torch.Tensor) -> List[torch.Tensor]:
-    tensor_list = torch.split(tensor, 1, dim=0)
-    # Convert the list of tensors to a Python list
-    tensor_list = [tensor.squeeze() for tensor in tensor_list]
-    return tensor_list
+    with xp.Trace('masks_to_list'):
+        tensor_list = torch.split(tensor, 1, dim=0)
+        # Convert the list of tensors to a Python list
+        tensor_list = [tensor.squeeze() for tensor in tensor_list]
+        return tensor_list
 
 
 def calculate_stability_score(

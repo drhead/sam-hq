@@ -170,3 +170,4 @@ cython_debug/
 .vscode/settings.json
 logdir/
 plugins/
+xla_debug.txt
