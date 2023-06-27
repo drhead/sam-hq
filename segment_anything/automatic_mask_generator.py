@@ -10,6 +10,7 @@ from torchvision.ops.boxes import batched_nms, box_area  # type: ignore
 import torch_xla.debug.profiler as xp
 import torch_xla.core.xla_model as xm
 import torch_xla.core.functions as xf
+import torch_xla.debug.metrics as met
 
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -240,7 +241,7 @@ class SamAutomaticMaskGenerator:
             keep_by_nms, num_kept = xf.nms(
                 boxes = data["boxes"].float(),
                 scores = data["iou_preds"],
-                score_threshold = torch.tensor(0, dtype=torch.float, device = xm.xla_device()),
+                score_threshold = torch.tensor(self.pred_iou_thresh, dtype=torch.float, device = xm.xla_device()),
                 iou_threshold = torch.tensor(self.box_nms_thresh, dtype=torch.float, device = xm.xla_device()),
                 output_size = data["boxes"].shape[0]
             )
@@ -265,7 +266,7 @@ class SamAutomaticMaskGenerator:
         multimask_output: bool = True,
     ) -> MaskData:
         orig_h, orig_w = orig_size
-
+        print("Start of Batch:"); print(met.short_metrics_report()); met.clear_all()
         # Run model on this batch
         transformed_points = self.predictor.transform.apply_coords(points, im_size)
         in_points = torch.as_tensor(transformed_points, device=self.predictor.device)
@@ -277,8 +278,8 @@ class SamAutomaticMaskGenerator:
                 multimask_output=multimask_output,
                 return_logits=True,
             )
-
-        # Serialize predictions and store in MaskData
+        print("Model Run:"); print(met.short_metrics_report()); met.clear_all()
+        # Serialize predictions and store in MaskData (Optimized)
         data = MaskData(
             masks=masks.flatten(0, 1),
             iou_preds=iou_preds.flatten(0, 1),
@@ -287,12 +288,7 @@ class SamAutomaticMaskGenerator:
         keep_mask = torch.ones(masks.shape[0], dtype=torch.bool, device=masks.device)
         del masks
 
-        # Filter by predicted IoU
-        with xp.Trace('filter_iou'):
-            if self.pred_iou_thresh > 0.0:
-                keep_mask = torch.logical_and(keep_mask, torch.as_tensor(data["iou_preds"] > self.pred_iou_thresh))
-
-        # Calculate stability score
+        # Calculate stability score (Optimized post-compile)
         with xp.Trace('filter_stab'):
             data["stability_score"] = calculate_stability_score(
                 data["masks"], self.predictor.model.mask_threshold, self.stability_score_offset
@@ -300,16 +296,16 @@ class SamAutomaticMaskGenerator:
             if self.stability_score_thresh > 0.0:
                 keep_mask = torch.logical_and(keep_mask, torch.as_tensor(data["stability_score"] >= self.stability_score_thresh))
 
-        # Threshold masks and calculate boxes
+        # Threshold masks and calculate boxes (Optimized post-compile)
         with xp.Trace('threshold_box'):
             data["masks"] = data["masks"] > self.predictor.model.mask_threshold
             data["boxes"] = batched_mask_to_box(data["masks"])
 
-        # Filter boxes that touch crop boundaries
+        # Filter boxes that touch crop boundaries (3x TransferToServerTime, insignificant)
         with xp.Trace('crop_bounds'):
             keep_mask = torch.logical_and(keep_mask, torch.as_tensor(~is_box_near_crop_edge(data["boxes"], crop_box, [0, 0, orig_w, orig_h])))
 
-        # Compress to RLE
+        # Tensors to list of tensors (Optimized)
         with xp.Trace('uncrop_masks'):
             data["masks"] = uncrop_masks(data["masks"], crop_box, orig_h, orig_w)
             data["segmentations"] = masks_to_tensor_list(data["masks"])
