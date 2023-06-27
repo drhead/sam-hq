@@ -9,6 +9,7 @@ import torch
 from torchvision.ops.boxes import batched_nms, box_area  # type: ignore
 import torch_xla.debug.profiler as xp
 import torch_xla.core.xla_model as xm
+import torch_xla.core.functions as xf
 
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -235,14 +236,15 @@ class SamAutomaticMaskGenerator:
 
         # Remove duplicates within this crop.
         with xp.Trace('batched_nms'):
-            keep_by_nms = batched_nms(
-                data["boxes"].float(),
-                data["iou_preds"],
-                torch.zeros_like(data["boxes"][:, 0]),  # categories
-                iou_threshold=self.box_nms_thresh,
+            keep_by_nms, num_kept = xf.nms(
+                boxes = data["boxes"].float(),
+                scores = data["iou_preds"],
+                score_threshold = torch.tensor(0, dtype=torch.float, device = xm.xla_device()),
+                iou_threshold = torch.tensor(self.box_nms_thresh, dtype=torch.float, device = xm.xla_device()),
+                output_size = data["boxes"].shape[0]
             )
             nms_mask = torch.zeros_like(data["iou_preds"], device=data["iou_preds"].device)
-            nms_mask[keep_by_nms] = True
+            nms_mask[keep_by_nms[:num_kept]] = True
             data["keep_mask"] = torch.logical_and(nms_mask, data["keep_mask"])
 
         # Return to the original image frame
