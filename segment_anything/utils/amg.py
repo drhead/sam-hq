@@ -28,9 +28,9 @@ class MaskData:
         self._stats = dict(**kwargs)
 
     def __setitem__(self, key: str, item: Any) -> None:
-        assert isinstance(
-            item, (list, np.ndarray, torch.Tensor)
-        ), "MaskData only supports list, numpy arrays, and torch tensors."
+        # assert isinstance(
+        #     item, (list, np.ndarray, torch.Tensor)
+        # ), "MaskData only supports list, numpy arrays, and torch tensors."
         self._stats[key] = item
 
     def __delitem__(self, key: str) -> None:
