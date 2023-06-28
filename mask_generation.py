@@ -16,6 +16,7 @@ print("PyTorch version:", torch.__version__)
 import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
@@ -25,8 +26,6 @@ import cv2
 import time
 import multiprocessing
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
-
-
 
 def trace_fn():
     xp.trace('localhost:6009', logdir='/home/lodestone/sam-hq/', num_tracing_attempts=1, host_tracer_level=3, timeout_s=15, duration_ms=10000)
@@ -38,8 +37,10 @@ if trace:
     server = xp.start_server(6009)
     time.sleep(5)
 
+SERIAL_EXEC = xmp.MpSerialExecutor()
+
 def _mp_fn(index):
-    print(f"Spawned process for index {index}")
+    print(f"[xla:{xm.get_ordinal()}] spawned process")
     # Per-device setup
     import torch_xla.experimental.pjrt_backend
     dist.init_process_group('xla', init_method='pjrt://')
@@ -50,7 +51,7 @@ def _mp_fn(index):
     model_type = "vit_l"
     sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
     sam.to(device)
-    print(f"Model moved to device on {index}")
+    print(f"[xla:{xm.get_ordinal()}] model moved to device")
     pjrt.broadcast_master_param(sam)
     sam.eval()
     sam_dynamo = torch.compile(sam, backend='torchxla_trace_once')
@@ -59,7 +60,7 @@ def _mp_fn(index):
         points_per_side=4,
         points_per_batch=16
     )
-    print(f"Model loaded on {index}")
+    print(f"[xla:{xm.get_ordinal()}] model loaded")
 
     # Dataset loading
     class CustomImageDataset(Dataset):
@@ -79,20 +80,40 @@ def _mp_fn(index):
             if self.transform:
                 image = self.transform(image)
             return image
-        
-    data_directory = "./data/zd_testimgs/"
-    dataset = CustomImageDataset(data_directory)
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=0)
+    
+    def load_dataset():
+        data_directory = "./data/zd_testimgs/"
+        return CustomImageDataset(data_directory)
+    
+    dataset = SERIAL_EXEC.run(lambda: load_dataset())
+    train_sampler = DistributedSampler(
+        dataset,
+        num_replicas=xm.xrt_world_size(),
+        rank=xm.get_ordinal(),
+        shuffle=False)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=4, 
+        sampler=train_sampler, 
+        num_workers=0)
     train_loader = pl.MpDeviceLoader(dataloader,device)
-    print(f"Dataset loaded on {index}")
+    print(f"[xla:{xm.get_ordinal()}] dataset loaded")
+    tracker = xm.RateTracker()
+    tic = 0
+    toc = 0
 
     # Main processing loop
     for batch_idx, (input) in enumerate(train_loader):
-        print(f"On device {index}, starting batch {batch_idx}")
+        tic = time.perf_counter()
+        print(f"[xla:{xm.get_ordinal()}] Load dataset in {tic - toc:0.4f} seconds")
+        print(f"[xla:{xm.get_ordinal()}] starting batch {batch_idx}")
         input=input.cpu().numpy()
         for i in range(input.shape[0]):
             masks = mask_generator.generate(input[i], multimask_output=False)
-            print(f"On device {index}, batch {batch_idx}, got {masks.shape[0]} masks")
+            tracker.add(1)
+            print(f"[xla:{xm.get_ordinal()}] batch {batch_idx}, got {masks.shape[0]} masks. Rate {tracker.rate()}, global {tracker.global_rate()}")
+        toc = time.perf_counter()
+        print(f"[xla:{xm.get_ordinal()}] Processed batch in {toc - tic:0.4f} seconds")
 
 if __name__ == '__main__':
-    xmp.spawn(_mp_fn, args=(), nprocs=8, start_method='spawn')
+    xmp.spawn(_mp_fn, args=(), start_method='spawn')
