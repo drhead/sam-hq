@@ -147,41 +147,25 @@ class SamAutomaticMaskGenerator:
         """
 
         # Generate masks
-        with xp.Trace('generate_masks'):
+        with xp.StepTrace('generate_masks'):
             mask_data = self._generate_masks(image, multimask_output)
 
-        # Filter small disconnected regions and holes in masks
-        if self.min_mask_region_area > 0:
-            print("WARN: Skipping postprocessing (bypassed pending refactor)")
-            # mask_data = self.postprocess_small_regions(
-            #     mask_data,
-            #     self.min_mask_region_area,
-            #     max(self.box_nms_thresh, self.crop_nms_thresh),
-            # )
+            # Filter small disconnected regions and holes in masks
+            if self.min_mask_region_area > 0:
+                print("WARN: Skipping postprocessing (bypassed pending refactor)")
+                # mask_data = self.postprocess_small_regions(
+                #     mask_data,
+                #     self.min_mask_region_area,
+                #     max(self.box_nms_thresh, self.crop_nms_thresh),
+                # )
 
-        # Write mask records
-        # curr_anns = []
-        # with xp.Trace('data_export'):
-            # for idx in range(len(mask_data["segmentations"])):
-            #     ann = {
-            #         "segmentation": mask_data["segmentations"][idx],
-            #         "area": torch.count_nonzero(mask_data["segmentations"][idx]),
-            #         "bbox": box_xyxy_to_xywh(mask_data["boxes"][idx]).tolist(),
-            #         "predicted_iou": mask_data["iou_preds"][idx].item(),
-            #         "point_coords": [mask_data["points"][idx].tolist()],
-            #         "stability_score": mask_data["stability_score"][idx].item(),
-            #         "crop_box": box_xyxy_to_xywh(mask_data["crop_boxes"][idx]).tolist(),
-            #     }
-            #     curr_anns.append(ann)
-        nms_indices = mask_data["nms_result_tuple"][0]
-        nms_valids = mask_data["nms_result_tuple"][1]
-        nms_mask = torch.logical_or(torch.arange(nms_indices.shape[0], device=nms_indices.device) < nms_valids, torch.zeros_like(nms_indices, dtype=torch.bool))
-
-        xm.mark_step()
-
-        mask_data["keep_mask"] = torch.index_select(mask_data["keep_mask"], 0, nms_indices)
-        mask_data["masks"] = torch.index_select(mask_data["masks"], 0, nms_indices)
-        return mask_data["masks"][torch.logical_and(mask_data["keep_mask"], nms_mask)]
+            nms_indices = mask_data["nms_result_tuple"][0]
+            nms_valids = mask_data["nms_result_tuple"][1]
+            nms_mask = torch.logical_or(torch.arange(nms_indices.shape[0], device=nms_indices.device) < nms_valids, torch.zeros_like(nms_indices, dtype=torch.bool))
+        with xp.Trace('data_export'):
+            mask_data["keep_mask"] = torch.index_select(mask_data["keep_mask"], 0, nms_indices)
+            mask_data["masks"] = torch.index_select(mask_data["masks"], 0, nms_indices)
+            return mask_data["masks"][torch.logical_and(mask_data["keep_mask"], nms_mask)]
 
     def _generate_masks(self, image: np.ndarray, multimask_output: bool = True) -> MaskData:
         orig_size = image.shape[:2]
