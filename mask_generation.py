@@ -8,7 +8,7 @@ os.environ['XLA_EMIT_STEPLOG'] = '1'
 
 os.environ['PJRT_DEVICE'] = 'TPU'
 os.environ['XLA_USE_BF16'] = '1'
-os.environ['MASTER_PORT'] = '29500'
+os.environ['MASTER_PORT'] = '29510'
 
 import numpy as np
 import torch
@@ -37,7 +37,7 @@ import torch_xla.utils.utils as xu
 import multiprocessing
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
 
-dist.init_process_group('xla', init_method='pjrt://')
+#dist.init_process_group('xla', init_method='pjrt://')
 
 from torch.utils.data import Dataset, DataLoader
 
@@ -70,7 +70,7 @@ sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
 sam.eval()
 sam_dynamo = torch.compile(sam, backend='torchxla_trace_once')
 
-WRAPPED_MODEL = xmp.MpModelWrapper(sam)
+WRAPPED_MODEL = xmp.MpModelWrapper(sam_dynamo)
 
 def gen_masks():
     xp.trace('localhost:6009', logdir='/home/lodestone/sam-hq/', num_tracing_attempts=1, host_tracer_level=3, timeout_s=15, duration_ms=10000)
@@ -90,15 +90,16 @@ if trace:
 
 def _mp_fn(index):
     print(f"Spawned process for index {index}")
-    if __name__ != '__main__':
-        dist.init_process_group('xla', init_method='pjrt://')
+
+    dist.init_process_group('xla', init_method='pjrt://')
+        
     model = WRAPPED_MODEL.to(xm.xla_device())
 
     print(f"Model moved to device on {index}")
     #model.eval()
     #sam_dynamo = torch.compile(model, backend='torchxla_trace_once')
     # print(f"Torch compiled on {index}")
-    #pjrt.broadcast_master_param(model)
+    pjrt.broadcast_master_param(model)
     # ddp_model = DDP(model, gradient_as_bucket_view=True)
     mask_generator = SamAutomaticMaskGenerator(
         model=model, # type: ignore
