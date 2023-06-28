@@ -99,13 +99,10 @@ def _mp_fn(index):
     train_loader = pl.MpDeviceLoader(dataloader,device)
     print(f"[xla:{xm.get_ordinal()}] dataset loaded")
     tracker = xm.RateTracker()
-    tic = 0
-    toc = 0
 
     # Main processing loop
     for batch_idx, (input) in enumerate(train_loader):
         tic = time.perf_counter()
-        print(f"[xla:{xm.get_ordinal()}] Load dataset in {tic - toc:0.4f} seconds")
         print(f"[xla:{xm.get_ordinal()}] starting batch {batch_idx}")
         input=input.cpu().numpy()
         for i in range(input.shape[0]):
