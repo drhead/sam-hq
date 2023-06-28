@@ -121,7 +121,7 @@ class SamAutomaticMaskGenerator:
         self.min_mask_region_area = min_mask_region_area
 
     @torch.no_grad()
-    def generate(self, image: np.ndarray, multimask_output: bool = True) -> torch.Tensor:
+    def generate(self, image: np.ndarray, multimask_output: bool = True) -> torch.Tensor: # TODO: Rework for batch processing
         """
         Generates masks for the given image.
 
@@ -158,16 +158,15 @@ class SamAutomaticMaskGenerator:
                 #     self.min_mask_region_area,
                 #     max(self.box_nms_thresh, self.crop_nms_thresh),
                 # )
-
             nms_indices = mask_data["nms_result_tuple"][0]
             nms_valids = mask_data["nms_result_tuple"][1]
-            nms_mask = torch.logical_or(torch.arange(nms_indices.shape[0], device=nms_indices.device) < nms_valids, torch.zeros_like(nms_indices, dtype=torch.bool))
         with xp.Trace('data_export'):
+            nms_mask = torch.logical_or(torch.arange(nms_indices.shape[0], device=nms_indices.device) < nms_valids, torch.zeros_like(nms_indices, dtype=torch.bool))
             mask_data["keep_mask"] = torch.index_select(mask_data["keep_mask"], 0, nms_indices)
             mask_data["masks"] = torch.index_select(mask_data["masks"], 0, nms_indices)
             return mask_data["masks"][torch.logical_and(mask_data["keep_mask"], nms_mask)]
 
-    def _generate_masks(self, image: np.ndarray, multimask_output: bool = True) -> MaskData:
+    def _generate_masks(self, image: np.ndarray, multimask_output: bool = True) -> MaskData: # TODO: Rework for batch processing
         orig_size = image.shape[:2]
         crop_boxes, layer_idxs = generate_crop_boxes(
             orig_size, self.crop_n_layers, self.crop_overlap_ratio
@@ -199,7 +198,7 @@ class SamAutomaticMaskGenerator:
             # data.to_numpy()
         return data
 
-    def _process_crop(
+    def _process_crop( # TODO: Rework for batch processing
         self,
         image: np.ndarray,
         crop_box: List[int],
