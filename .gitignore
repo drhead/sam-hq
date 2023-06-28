@@ -171,3 +171,5 @@ cython_debug/
 logdir/
 plugins/
 xla_debug.txt
+error.txt
+output.txt

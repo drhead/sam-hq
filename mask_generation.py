@@ -63,9 +63,12 @@ data_directory = "./data/zd_testimgs/"
 dataset = CustomImageDataset(data_directory)
 dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=0)
 
-sam_checkpoint = "pretrained_checkpoint/sam_hq_vit_h.pth"
-model_type = "vit_h"
+sam_checkpoint = "pretrained_checkpoint/sam_hq_vit_l.pth"
+model_type = "vit_l"
 sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+sam.eval()
+sam_dynamo = torch.compile(sam, backend='torchxla_trace_once')
+
 WRAPPED_MODEL = xmp.MpModelWrapper(sam)
 
 def gen_masks():
@@ -84,18 +87,19 @@ def load_dataset():
     # dataset = CustomImageDataset(path)
     # return DataLoader(dataset, batch_size=32, shuffle=True, num_workers=0)
 
-def _mp_fn(index, model):
+def _mp_fn(index):
     print(f"Spawned process for index {index}")
     dist.init_process_group('xla', init_method='pjrt://')
     model = WRAPPED_MODEL.to(xm.xla_device())
+
     print(f"Model moved to device on {index}")
-    model.eval()
-    sam_dynamo = torch.compile(model, backend='torchxla_trace_once')
-    print(f"Torch compiled on {index}")
-    # pjrt.broadcast_master_param(sam_dynamo)
-    ddp_model = DDP(model, gradient_as_bucket_view=True)
+    #model.eval()
+    #sam_dynamo = torch.compile(model, backend='torchxla_trace_once')
+    # print(f"Torch compiled on {index}")
+    #pjrt.broadcast_master_param(model)
+    # ddp_model = DDP(model, gradient_as_bucket_view=True)
     mask_generator = SamAutomaticMaskGenerator(
-        model=sam_dynamo, # type: ignore
+        model=model, # type: ignore
         points_per_side=4,
         points_per_batch=16
     )
@@ -110,4 +114,4 @@ def _mp_fn(index, model):
             print(f"On device {index}, batch {batch_idx}, got {masks.shape[0]} masks")
 
 if __name__ == '__main__':
-    xmp.spawn(_mp_fn, args=(sam, ), start_method='fork')
+    xmp.spawn(_mp_fn, args=(), start_method='fork')
