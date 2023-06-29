@@ -7,6 +7,7 @@
 import numpy as np
 import torch
 from torch.nn import functional as F
+import torch_xla.core.xla_model as xm
 from torchvision.transforms.functional import resize, to_pil_image  # type: ignore
 
 from copy import deepcopy
@@ -61,7 +62,7 @@ class ResizeLongestSide:
         # Expects an image in BCHW format. May not exactly match apply_image.
         target_size = self.get_preprocess_shape(image.shape[2], image.shape[3], self.target_length)
         return F.interpolate(
-            image, target_size, mode="bilinear", align_corners=False, antialias=False
+            image, target_size, mode="nearest",  antialias=False
         )
 
     def apply_coords_torch(

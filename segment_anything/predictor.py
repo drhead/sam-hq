@@ -6,7 +6,7 @@
 
 import numpy as np
 import torch
-
+import torch_xla.core.xla_model as xm
 from .modeling import Sam
 
 from typing import Optional, Tuple
@@ -86,7 +86,7 @@ class SamPredictor:
         if image_format != self.model.image_format:
             torch_image = torch_image[..., ::-1]
         input_image = self.transform.apply_image_torch(torch_image)
-        input_image_transformed = torch.as_tensor(input_image, device=self.device)
+        input_image_transformed = input_image.to(xm.xla_device())
 
         self.set_torch_image(input_image_transformed, torch_image.shape[2:])
 

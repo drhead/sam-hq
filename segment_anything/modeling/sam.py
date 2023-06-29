@@ -157,11 +157,10 @@ class Sam(nn.Module):
         masks = F.interpolate(
             masks,
             (self.image_encoder.img_size, self.image_encoder.img_size),
-            mode="bilinear",
-            align_corners=False,
+            mode="nearest"
         )
         masks = masks[..., : input_size[0], : input_size[1]]
-        masks = F.interpolate(masks, original_size, mode="bilinear", align_corners=False)
+        masks = F.interpolate(masks, original_size, mode="nearest")
         return masks
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:

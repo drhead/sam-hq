@@ -38,7 +38,7 @@ def trace_fn():
         timeout_s=15, 
         duration_ms=60000)
     print('++++++++  END OF PROFILING  ++++++++')
-trace = False
+trace = True
 p = multiprocessing.Process(target=trace_fn)
 
 SERIAL_EXEC = xmp.MpSerialExecutor()
@@ -64,8 +64,8 @@ def _mp_fn(index):
     sam_dynamo = torch.compile(sam, backend='torchxla_trace_once')
     mask_generator = SamAutomaticMaskGenerator(
         model=sam_dynamo, # type: ignore
-        points_per_side=8,
-        points_per_batch=64
+        points_per_side=4,
+        points_per_batch=16
     )
 
     print(f"[xla:{xm.get_ordinal()}] model loaded")
@@ -95,7 +95,7 @@ def _mp_fn(index):
 
     def load_dataset():
         data_directory = "./data/zd_testimgs/"
-        # data_directory = "./data/zd_testimgs/"
+        # data_directory = "./one_testimg/"
         return CustomImageDataset(
             data_directory,
             transform=HWCtoBCHWTransform())
@@ -118,11 +118,10 @@ def _mp_fn(index):
 
     # Main processing loop
     for batch_idx, (input) in enumerate(train_loader):
-        image = input.cpu()
-        masks, valid = mask_generator.generate(image, multimask_output=False)
+        masks, valid = mask_generator.generate(input, multimask_output=False)
         tracker.add(1)
         print(f"[xla:{xm.get_ordinal()}] batch {batch_idx}, got {valid.count_nonzero()} masks. Rate {tracker.rate()}, global {tracker.global_rate()}")
 if __name__ == '__main__':
     if trace: p.start()
     # _mp_fn(1)
-    xmp.spawn(_mp_fn, args=(), nprocs=1, start_method='spawn')
+    xmp.spawn(_mp_fn, args=(), start_method='spawn')
