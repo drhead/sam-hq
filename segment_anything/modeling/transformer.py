@@ -6,6 +6,7 @@
 
 import torch
 from torch import Tensor, nn
+import torch_xla.debug.profiler as xp
 
 import math
 from typing import Tuple, Type
@@ -79,31 +80,32 @@ class TwoWayTransformer(nn.Module):
           torch.Tensor: the processed image_embedding
         """
         # BxCxHxW -> BxHWxC == B x N_image_tokens x C
-        bs, c, h, w = image_embedding.shape
-        image_embedding = image_embedding.flatten(2).permute(0, 2, 1)
-        image_pe = image_pe.flatten(2).permute(0, 2, 1)
+        with xp.Trace('tfm_2way_forward'):
+            bs, c, h, w = image_embedding.shape
+            image_embedding = image_embedding.flatten(2).permute(0, 2, 1)
+            image_pe = image_pe.flatten(2).permute(0, 2, 1)
 
-        # Prepare queries
-        queries = point_embedding
-        keys = image_embedding
+            # Prepare queries
+            queries = point_embedding
+            keys = image_embedding
 
-        # Apply transformer blocks and final layernorm
-        for layer in self.layers:
-            queries, keys = layer(
-                queries=queries,
-                keys=keys,
-                query_pe=point_embedding,
-                key_pe=image_pe,
-            )
+            # Apply transformer blocks and final layernorm
+            for layer in self.layers:
+                queries, keys = layer(
+                    queries=queries,
+                    keys=keys,
+                    query_pe=point_embedding,
+                    key_pe=image_pe,
+                )
 
-        # Apply the final attention layer from the points to the image
-        q = queries + point_embedding
-        k = keys + image_pe
-        attn_out = self.final_attn_token_to_image(q=q, k=k, v=keys)
-        queries = queries + attn_out
-        queries = self.norm_final_attn(queries)
+            # Apply the final attention layer from the points to the image
+            q = queries + point_embedding
+            k = keys + image_pe
+            attn_out = self.final_attn_token_to_image(q=q, k=k, v=keys)
+            queries = queries + attn_out
+            queries = self.norm_final_attn(queries)
 
-        return queries, keys
+            return queries, keys
 
 
 class TwoWayAttentionBlock(nn.Module):
@@ -151,35 +153,36 @@ class TwoWayAttentionBlock(nn.Module):
     def forward(
         self, queries: Tensor, keys: Tensor, query_pe: Tensor, key_pe: Tensor
     ) -> Tuple[Tensor, Tensor]:
-        # Self attention block
-        if self.skip_first_layer_pe:
-            queries = self.self_attn(q=queries, k=queries, v=queries)
-        else:
+        with xp.Trace('tfm_2way_attn_forward'):
+            # Self attention block
+            if self.skip_first_layer_pe:
+                queries = self.self_attn(q=queries, k=queries, v=queries)
+            else:
+                q = queries + query_pe
+                attn_out = self.self_attn(q=q, k=q, v=queries)
+                queries = queries + attn_out
+            queries = self.norm1(queries)
+
+            # Cross attention block, tokens attending to image embedding
             q = queries + query_pe
-            attn_out = self.self_attn(q=q, k=q, v=queries)
+            k = keys + key_pe
+            attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys)
             queries = queries + attn_out
-        queries = self.norm1(queries)
+            queries = self.norm2(queries)
 
-        # Cross attention block, tokens attending to image embedding
-        q = queries + query_pe
-        k = keys + key_pe
-        attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys)
-        queries = queries + attn_out
-        queries = self.norm2(queries)
+            # MLP block
+            mlp_out = self.mlp(queries)
+            queries = queries + mlp_out
+            queries = self.norm3(queries)
 
-        # MLP block
-        mlp_out = self.mlp(queries)
-        queries = queries + mlp_out
-        queries = self.norm3(queries)
+            # Cross attention block, image embedding attending to tokens
+            q = queries + query_pe
+            k = keys + key_pe
+            attn_out = self.cross_attn_image_to_token(q=k, k=q, v=queries)
+            keys = keys + attn_out
+            keys = self.norm4(keys)
 
-        # Cross attention block, image embedding attending to tokens
-        q = queries + query_pe
-        k = keys + key_pe
-        attn_out = self.cross_attn_image_to_token(q=k, k=q, v=queries)
-        keys = keys + attn_out
-        keys = self.norm4(keys)
-
-        return queries, keys
+            return queries, keys
 
 
 class Attention(nn.Module):
@@ -216,25 +219,26 @@ class Attention(nn.Module):
         return x.reshape(b, n_tokens, n_heads * c_per_head)  # B x N_tokens x C
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-        # Input projections
-        q = self.q_proj(q)
-        k = self.k_proj(k)
-        v = self.v_proj(v)
+        with xp.Trace('tfm_attn_forward'):
+            # Input projections
+            q = self.q_proj(q)
+            k = self.k_proj(k)
+            v = self.v_proj(v)
 
-        # Separate into heads
-        q = self._separate_heads(q, self.num_heads)
-        k = self._separate_heads(k, self.num_heads)
-        v = self._separate_heads(v, self.num_heads)
+            # Separate into heads
+            q = self._separate_heads(q, self.num_heads)
+            k = self._separate_heads(k, self.num_heads)
+            v = self._separate_heads(v, self.num_heads)
 
-        # Attention
-        _, _, _, c_per_head = q.shape
-        attn = q @ k.permute(0, 1, 3, 2)  # B x N_heads x N_tokens x N_tokens
-        attn = attn / math.sqrt(c_per_head)
-        attn = torch.softmax(attn, dim=-1)
+            # Attention
+            _, _, _, c_per_head = q.shape
+            attn = q @ k.permute(0, 1, 3, 2)  # B x N_heads x N_tokens x N_tokens
+            attn = attn / math.sqrt(c_per_head)
+            attn = torch.softmax(attn, dim=-1)
 
-        # Get output
-        out = attn @ v
-        out = self._recombine_heads(out)
-        out = self.out_proj(out)
+            # Get output
+            out = attn @ v
+            out = self._recombine_heads(out)
+            out = self.out_proj(out)
 
-        return out
+            return out

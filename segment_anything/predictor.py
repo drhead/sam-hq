@@ -31,7 +31,7 @@ class SamPredictor:
         self.transform = ResizeLongestSide(sam_model.image_encoder.img_size)
         self.reset_image()
 
-    def set_image(
+    def set_image(  # TODO: Rework for batch processing
         self,
         image: np.ndarray,
         image_format: str = "RGB",
@@ -60,6 +60,35 @@ class SamPredictor:
         input_image_torch = input_image_torch.permute(2, 0, 1).contiguous()[None, :, :, :]
 
         self.set_torch_image(input_image_torch, image.shape[:2])
+
+    @torch.no_grad()
+    def set_torch_image_process(
+        self,
+        torch_image: torch.Tensor,
+        image_format: str = "RGB",
+    ) -> None:
+        """
+        Calculates the image embeddings for the provided image, allowing
+        masks to be predicted with the 'predict' method. Does not expect 
+        the image to be processed already.
+
+        Arguments:
+          transformed_image (torch.Tensor): The input image, with shape
+            1x3xHxW, which has been transformed with ResizeLongestSide.
+          original_image_size (tuple(int, int)): The size of the image
+            before transformation, in (H, W) format.
+        """
+        assert image_format in [
+            "RGB",
+            "BGR",
+        ], f"image_format must be in ['RGB', 'BGR'], is {image_format}."
+        # import pdb;pdb.set_trace()
+        if image_format != self.model.image_format:
+            torch_image = torch_image[..., ::-1]
+        input_image = self.transform.apply_image_torch(torch_image)
+        input_image_transformed = torch.as_tensor(input_image, device=self.device)
+
+        self.set_torch_image(input_image_transformed, torch_image.shape[2:])
 
     @torch.no_grad()
     def set_torch_image(

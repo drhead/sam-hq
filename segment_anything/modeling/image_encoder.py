@@ -7,6 +7,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_xla.debug.profiler as xp
 
 from typing import Optional, Tuple, Type
 
@@ -104,19 +105,20 @@ class ImageEncoderViT(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.patch_embed(x)
-        if self.pos_embed is not None:
-            x = x + self.pos_embed
+        with xp.Trace('encoder_ViT_forward'):
+            x = self.patch_embed(x)
+            if self.pos_embed is not None:
+                x = x + self.pos_embed
 
-        interm_embeddings=[]
-        for blk in self.blocks:
-            x = blk(x)
-            if blk.window_size == 0:
-                interm_embeddings.append(x)
+            interm_embeddings=[]
+            for blk in self.blocks:
+                x = blk(x)
+                if blk.window_size == 0:
+                    interm_embeddings.append(x)
 
-        x = self.neck(x.permute(0, 3, 1, 2))
+            x = self.neck(x.permute(0, 3, 1, 2))
 
-        return x, interm_embeddings
+            return x, interm_embeddings # type: ignore
 
 
 class Block(nn.Module):
@@ -167,22 +169,23 @@ class Block(nn.Module):
         self.window_size = window_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        shortcut = x
-        x = self.norm1(x)
-        # Window partition
-        if self.window_size > 0:
-            H, W = x.shape[1], x.shape[2]
-            x, pad_hw = window_partition(x, self.window_size)
+        with xp.Trace('encoder_block_forward'):
+            shortcut = x
+            x = self.norm1(x)
+            # Window partition
+            if self.window_size > 0:
+                H, W = x.shape[1], x.shape[2]
+                x, pad_hw = window_partition(x, self.window_size)
 
-        x = self.attn(x)
-        # Reverse window partition
-        if self.window_size > 0:
-            x = window_unpartition(x, self.window_size, pad_hw, (H, W))
+            x = self.attn(x)
+            # Reverse window partition
+            if self.window_size > 0:
+                x = window_unpartition(x, self.window_size, pad_hw, (H, W)) # type: ignore
 
-        x = shortcut + x
-        x = x + self.mlp(self.norm2(x))
+            x = shortcut + x
+            x = x + self.mlp(self.norm2(x))
 
-        return x
+            return x
 
 
 class Attention(nn.Module):
@@ -225,22 +228,23 @@ class Attention(nn.Module):
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, H, W, _ = x.shape
-        # qkv with shape (3, B, nHead, H * W, C)
-        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-        # q, k, v with shape (B * nHead, H * W, C)
-        q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
+        with xp.Trace('encoder_attn_forward'):
+            B, H, W, _ = x.shape
+            # qkv with shape (3, B, nHead, H * W, C)
+            qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+            # q, k, v with shape (B * nHead, H * W, C)
+            q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
 
-        attn = (q * self.scale) @ k.transpose(-2, -1)
+            attn = (q * self.scale) @ k.transpose(-2, -1)
 
-        if self.use_rel_pos:
-            attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            if self.use_rel_pos:
+                attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
 
-        attn = attn.softmax(dim=-1)
-        x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
-        x = self.proj(x)
+            attn = attn.softmax(dim=-1)
+            x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+            x = self.proj(x)
 
-        return x
+            return x
 
 
 def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
@@ -392,7 +396,8 @@ class PatchEmbed(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)
-        # B C H W -> B H W C
-        x = x.permute(0, 2, 3, 1)
-        return x
+        with xp.Trace('encoder_patch_forward'):
+            x = self.proj(x)
+            # B C H W -> B H W C
+            x = x.permute(0, 2, 3, 1)
+            return x

@@ -7,6 +7,7 @@
 import numpy as np
 import torch
 from torch import nn
+import torch_xla.debug.profiler as xp
 
 from typing import Any, Optional, Tuple, Type
 
@@ -150,24 +151,25 @@ class PromptEncoder(nn.Module):
           torch.Tensor: dense embeddings for the masks, in the shape
             Bx(embed_dim)x(embed_H)x(embed_W)
         """
-        bs = self._get_batch_size(points, boxes, masks)
-        sparse_embeddings = torch.empty((bs, 0, self.embed_dim), device=self._get_device())
-        if points is not None:
-            coords, labels = points
-            point_embeddings = self._embed_points(coords, labels, pad=(boxes is None))
-            sparse_embeddings = torch.cat([sparse_embeddings, point_embeddings], dim=1)
-        if boxes is not None:
-            box_embeddings = self._embed_boxes(boxes)
-            sparse_embeddings = torch.cat([sparse_embeddings, box_embeddings], dim=1)
+        with xp.Trace('encoder_prompt_forward'):
+            bs = self._get_batch_size(points, boxes, masks)
+            sparse_embeddings = torch.empty((bs, 0, self.embed_dim), device=self._get_device())
+            if points is not None:
+                coords, labels = points
+                point_embeddings = self._embed_points(coords, labels, pad=(boxes is None))
+                sparse_embeddings = torch.cat([sparse_embeddings, point_embeddings], dim=1)
+            if boxes is not None:
+                box_embeddings = self._embed_boxes(boxes)
+                sparse_embeddings = torch.cat([sparse_embeddings, box_embeddings], dim=1)
 
-        if masks is not None:
-            dense_embeddings = self._embed_masks(masks)
-        else:
-            dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
-                bs, -1, self.image_embedding_size[0], self.image_embedding_size[1]
-            )
+            if masks is not None:
+                dense_embeddings = self._embed_masks(masks)
+            else:
+                dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+                    bs, -1, self.image_embedding_size[0], self.image_embedding_size[1]
+                )
 
-        return sparse_embeddings, dense_embeddings
+            return sparse_embeddings, dense_embeddings
 
 
 class PositionEmbeddingRandom(nn.Module):
@@ -194,23 +196,25 @@ class PositionEmbeddingRandom(nn.Module):
         return torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1)
 
     def forward(self, size: Tuple[int, int]) -> torch.Tensor:
-        """Generate positional encoding for a grid of the specified size."""
-        h, w = size
-        device: Any = self.positional_encoding_gaussian_matrix.device
-        grid = torch.ones((h, w), device=device, dtype=torch.float32)
-        y_embed = grid.cumsum(dim=0) - 0.5
-        x_embed = grid.cumsum(dim=1) - 0.5
-        y_embed = y_embed / h
-        x_embed = x_embed / w
+        with xp.Trace('encoder_pe_forward'):
+            """Generate positional encoding for a grid of the specified size."""
+            h, w = size
+            device: Any = self.positional_encoding_gaussian_matrix.device
+            grid = torch.ones((h, w), device=device, dtype=torch.float32)
+            y_embed = grid.cumsum(dim=0) - 0.5
+            x_embed = grid.cumsum(dim=1) - 0.5
+            y_embed = y_embed / h
+            x_embed = x_embed / w
 
-        pe = self._pe_encoding(torch.stack([x_embed, y_embed], dim=-1))
-        return pe.permute(2, 0, 1)  # C x H x W
+            pe = self._pe_encoding(torch.stack([x_embed, y_embed], dim=-1))
+            return pe.permute(2, 0, 1)  # C x H x W
 
     def forward_with_coords(
         self, coords_input: torch.Tensor, image_size: Tuple[int, int]
     ) -> torch.Tensor:
-        """Positionally encode points that are not normalized to [0,1]."""
-        coords = coords_input.clone()
-        coords[:, :, 0] = coords[:, :, 0] / image_size[1]
-        coords[:, :, 1] = coords[:, :, 1] / image_size[0]
-        return self._pe_encoding(coords.to(torch.float))  # B x N x C
+        with xp.Trace('encoder_pe_coord_forward'):
+            """Positionally encode points that are not normalized to [0,1]."""
+            coords = coords_input.clone()
+            coords[:, :, 0] = coords[:, :, 0] / image_size[1]
+            coords[:, :, 1] = coords[:, :, 1] / image_size[0]
+            return self._pe_encoding(coords.to(torch.float))  # B x N x C

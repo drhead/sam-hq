@@ -8,6 +8,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+import torch_xla.debug.profiler as xp
 
 from typing import List, Tuple, Type
 
@@ -121,39 +122,40 @@ class MaskDecoderHQ(nn.Module):
           torch.Tensor: batched predicted masks
           torch.Tensor: batched predictions of mask quality
         """
-        vit_features = interm_embeddings[0].permute(0, 3, 1, 2) # early-layer ViT feature, after 1st global attention block in ViT
-        hq_features = self.embedding_encoder(image_embeddings) + self.compress_vit_feat(vit_features)
+        with xp.Trace('decoder_hq_forward'):
+            vit_features = interm_embeddings[0].permute(0, 3, 1, 2) # early-layer ViT feature, after 1st global attention block in ViT
+            hq_features = self.embedding_encoder(image_embeddings) + self.compress_vit_feat(vit_features)
 
-        masks, iou_pred = self.predict_masks(
-            image_embeddings=image_embeddings,
-            image_pe=image_pe,
-            sparse_prompt_embeddings=sparse_prompt_embeddings,
-            dense_prompt_embeddings=dense_prompt_embeddings,
-            hq_features=hq_features,
-        )
+            masks, iou_pred = self.predict_masks(
+                image_embeddings=image_embeddings,
+                image_pe=image_pe,
+                sparse_prompt_embeddings=sparse_prompt_embeddings,
+                dense_prompt_embeddings=dense_prompt_embeddings,
+                hq_features=hq_features,
+            )
 
-        # Select the correct mask or masks for output
-        if multimask_output:
-            # mask with highest score
-            mask_slice = slice(1,self.num_mask_tokens-1)
-            iou_pred = iou_pred[:, mask_slice]
-            iou_pred, max_iou_idx = torch.max(iou_pred,dim=1)
-            iou_pred = iou_pred.unsqueeze(1)
-            masks_multi = masks[:, mask_slice, :, :]
-            masks_sam = masks_multi[torch.arange(masks_multi.size(0)),max_iou_idx].unsqueeze(1)
-        else:
-            # singale mask output, default
-            mask_slice = slice(0, 1)
-            iou_pred = iou_pred[:,mask_slice]
-            masks_sam = masks[:,mask_slice]
+            # Select the correct mask or masks for output
+            if multimask_output:
+                # mask with highest score
+                mask_slice = slice(1,self.num_mask_tokens-1)
+                iou_pred = iou_pred[:, mask_slice]
+                iou_pred, max_iou_idx = torch.max(iou_pred,dim=1)
+                iou_pred = iou_pred.unsqueeze(1)
+                masks_multi = masks[:, mask_slice, :, :]
+                masks_sam = masks_multi[torch.arange(masks_multi.size(0)),max_iou_idx].unsqueeze(1)
+            else:
+                # singale mask output, default
+                mask_slice = slice(0, 1)
+                iou_pred = iou_pred[:,mask_slice]
+                masks_sam = masks[:,mask_slice]
 
-        masks_hq = masks[:,slice(self.num_mask_tokens-1, self.num_mask_tokens)]
-        if hq_token_only:
-            masks = masks_hq
-        else:
-            masks = masks_sam + masks_hq
-        # Prepare output
-        return masks, iou_pred
+            masks_hq = masks[:,slice(self.num_mask_tokens-1, self.num_mask_tokens)]
+            if hq_token_only:
+                masks = masks_hq
+            else:
+                masks = masks_sam + masks_hq
+            # Prepare output
+            return masks, iou_pred
 
     def predict_masks(
         self,
@@ -230,8 +232,9 @@ class MLP(nn.Module):
         self.sigmoid_output = sigmoid_output
 
     def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-        if self.sigmoid_output:
-            x = F.sigmoid(x)
-        return x
+        with xp.Trace('decoder_MLP_forward'):
+            for i, layer in enumerate(self.layers):
+                x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+            if self.sigmoid_output:
+                x = F.sigmoid(x)
+            return x

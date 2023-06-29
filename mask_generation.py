@@ -5,18 +5,17 @@ import os
 # os.environ['XLA_IR_DEBUG'] = '1'
 # os.environ['XLA_HLO_DEBUG'] = '1'
 # os.environ['XLA_EMIT_STEPLOG'] = '1'
-
 os.environ['PJRT_DEVICE'] = 'TPU'
 os.environ['XLA_USE_BF16'] = '1'
 os.environ['MASTER_PORT'] = '29510'
 
 import numpy as np
 import torch
-print("PyTorch version:", torch.__version__)
 import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torchvision.transforms import transforms
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
@@ -25,41 +24,50 @@ import torch_xla.debug.profiler as xp
 import cv2
 import time
 import multiprocessing
+import pickle
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
 
 def trace_fn():
-    xp.trace('localhost:6009', logdir='/home/lodestone/sam-hq/', num_tracing_attempts=1, host_tracer_level=3, timeout_s=15, duration_ms=10000)
-    print('Done tracing')
+    time.sleep(90)
+    print('++++++++ START OF PROFILING ++++++++')
+    xp.trace(
+        'localhost:6009', 
+        logdir='/home/lodestone/sam-hq/',  
+        num_tracing_attempts=3, 
+        host_tracer_level=3, 
+        timeout_s=15, 
+        duration_ms=60000)
+    print('++++++++  END OF PROFILING  ++++++++')
 trace = False
 p = multiprocessing.Process(target=trace_fn)
-if trace:
-    p.start()
-    server = xp.start_server(6009)
-    time.sleep(5)
 
 SERIAL_EXEC = xmp.MpSerialExecutor()
 
 def _mp_fn(index):
+    server = xp.start_server(6009)
+
     print(f"[xla:{xm.get_ordinal()}] spawned process")
     # Per-device setup
     import torch_xla.experimental.pjrt_backend
     dist.init_process_group('xla', init_method='pjrt://')
     device = xm.xla_device()
-
+    
     # Model loading
-    sam_checkpoint = "pretrained_checkpoint/sam_hq_vit_l.pth"
-    model_type = "vit_l"
+    sam_checkpoint = "pretrained_checkpoint/sam_hq_vit_h.pth"
+    model_type = "vit_h"
     sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
     sam.to(device)
+
     print(f"[xla:{xm.get_ordinal()}] model moved to device")
-    pjrt.broadcast_master_param(sam)
+
     sam.eval()
     sam_dynamo = torch.compile(sam, backend='torchxla_trace_once')
     mask_generator = SamAutomaticMaskGenerator(
         model=sam_dynamo, # type: ignore
-        points_per_side=4,
-        points_per_batch=16
+        points_per_side=8,
+        points_per_batch=64
     )
+
     print(f"[xla:{xm.get_ordinal()}] model loaded")
 
     # Dataset loading
@@ -81,9 +89,16 @@ def _mp_fn(index):
                 image = self.transform(image)
             return image
     
+    class HWCtoBCHWTransform():
+        def __call__(self, img):
+            return torch.as_tensor(img).permute(2, 0, 1)
+
     def load_dataset():
         data_directory = "./data/zd_testimgs/"
-        return CustomImageDataset(data_directory)
+        # data_directory = "./data/zd_testimgs/"
+        return CustomImageDataset(
+            data_directory,
+            transform=HWCtoBCHWTransform())
     
     dataset = SERIAL_EXEC.run(lambda: load_dataset())
     train_sampler = DistributedSampler(
@@ -93,24 +108,21 @@ def _mp_fn(index):
         shuffle=False)
     dataloader = DataLoader(
         dataset,
-        batch_size=4, 
+        batch_size=1, 
         sampler=train_sampler, 
         num_workers=0)
     train_loader = pl.MpDeviceLoader(dataloader,device)
+
     print(f"[xla:{xm.get_ordinal()}] dataset loaded")
     tracker = xm.RateTracker()
 
     # Main processing loop
     for batch_idx, (input) in enumerate(train_loader):
-        tic = time.perf_counter()
-        print(f"[xla:{xm.get_ordinal()}] starting batch {batch_idx}")
-        input=input.cpu().numpy()
-        for i in range(input.shape[0]):
-            masks = mask_generator.generate(input[i], multimask_output=False)
-            tracker.add(1)
-            print(f"[xla:{xm.get_ordinal()}] batch {batch_idx}, got {masks.shape[0]} masks. Rate {tracker.rate()}, global {tracker.global_rate()}")
-        toc = time.perf_counter()
-        print(f"[xla:{xm.get_ordinal()}] Processed batch in {toc - tic:0.4f} seconds")
-
+        image = input.cpu()
+        masks, valid = mask_generator.generate(image, multimask_output=False)
+        tracker.add(1)
+        print(f"[xla:{xm.get_ordinal()}] batch {batch_idx}, got {valid.count_nonzero()} masks. Rate {tracker.rate()}, global {tracker.global_rate()}")
 if __name__ == '__main__':
-    xmp.spawn(_mp_fn, args=(), start_method='spawn')
+    if trace: p.start()
+    # _mp_fn(1)
+    xmp.spawn(_mp_fn, args=(), nprocs=1, start_method='spawn')
