@@ -2,8 +2,8 @@ import os
 
 # os.environ['PT_XLA_DEBUG'] = '1' 
 # os.environ['PT_XLA_DEBUG_FILE'] = './xla_debug.txt'
-# os.environ['XLA_IR_DEBUG'] = '1'
-# os.environ['XLA_HLO_DEBUG'] = '1'
+os.environ['XLA_IR_DEBUG'] = '1'
+os.environ['XLA_HLO_DEBUG'] = '1'
 # os.environ['XLA_EMIT_STEPLOG'] = '1'
 os.environ['PJRT_DEVICE'] = 'TPU'
 os.environ['XLA_USE_BF16'] = '1'
