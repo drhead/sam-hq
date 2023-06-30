@@ -7,6 +7,7 @@
 import numpy as np
 import torch
 import torch_xla.core.xla_model as xm
+import torch_xla.debug.profiler as xp
 from .modeling import Sam
 
 from typing import Optional, Tuple
@@ -271,7 +272,8 @@ class SamPredictor:
         )
 
         # Upscale the masks to the original image resolution
-        masks = self.model.postprocess_masks(low_res_masks, self.input_size, self.original_size)
+        with xp.Trace('postprocess_masks'):
+            masks = self.model.postprocess_masks(low_res_masks, self.input_size, self.original_size)
 
         if not return_logits:
             masks = masks > self.model.mask_threshold

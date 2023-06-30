@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn as nn
+import torch_xla.debug.profiler as xp
 
 from typing import Type
 
@@ -23,7 +24,8 @@ class MLPBlock(nn.Module):
         self.act = act()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.lin2(self.act(self.lin1(x)))
+        with xp.Trace('common_mlp_block'):
+            return self.lin2(self.act(self.lin1(x)))
 
 
 # From https://github.com/facebookresearch/detectron2/blob/main/detectron2/layers/batch_norm.py # noqa
@@ -36,8 +38,9 @@ class LayerNorm2d(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        u = x.mean(1, keepdim=True)
-        s = (x - u).pow(2).mean(1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.eps)
-        x = self.weight[:, None, None] * x + self.bias[:, None, None]
-        return x
+        with xp.Trace('common_layer_norm2d'):
+            u = x.mean(1, keepdim=True)
+            s = (x - u).pow(2).mean(1, keepdim=True)
+            x = (x - u) / torch.sqrt(s + self.eps)
+            x = self.weight[:, None, None] * x + self.bias[:, None, None]
+            return x
