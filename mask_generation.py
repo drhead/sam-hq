@@ -36,7 +36,7 @@ def trace_fn():
         num_tracing_attempts=3, 
         host_tracer_level=3, 
         timeout_s=15, 
-        duration_ms=60000)
+        duration_ms=30000)
     print('++++++++  END OF PROFILING  ++++++++')
 trace = True
 p = multiprocessing.Process(target=trace_fn)
@@ -89,16 +89,17 @@ def _mp_fn(index):
                 image = self.transform(image)
             return image
     
-    class HWCtoBCHWTransform():
+    class HWCtoCHWTransform():
         def __call__(self, img):
             return torch.as_tensor(img).permute(2, 0, 1)
 
     def load_dataset():
         data_directory = "./data/zd_testimgs/"
-        # data_directory = "./one_testimg/"
+        #data_directory = "./one_testimg/"
+        #data_directory = "./two_testimgs/"
         return CustomImageDataset(
             data_directory,
-            transform=HWCtoBCHWTransform())
+            transform=HWCtoCHWTransform())
     
     dataset = SERIAL_EXEC.run(lambda: load_dataset())
     train_sampler = DistributedSampler(
@@ -108,7 +109,7 @@ def _mp_fn(index):
         shuffle=False)
     dataloader = DataLoader(
         dataset,
-        batch_size=1, 
+        batch_size=2, 
         sampler=train_sampler, 
         num_workers=0)
     train_loader = pl.MpDeviceLoader(dataloader,device)
@@ -124,4 +125,4 @@ def _mp_fn(index):
 if __name__ == '__main__':
     if trace: p.start()
     # _mp_fn(1)
-    xmp.spawn(_mp_fn, args=(), start_method='spawn')
+    xmp.spawn(_mp_fn, args=(), nprocs=1, start_method='spawn')
