@@ -159,12 +159,22 @@ class SamAutomaticMaskGenerator:
                 #     max(self.box_nms_thresh, self.crop_nms_thresh),
                 # )
         with xp.Trace('data_export'):
-            nms_indices = mask_data["nms_result_tuple"][0]
-            nms_valids = mask_data["nms_result_tuple"][1]
-            nms_mask = torch.logical_or(torch.arange(nms_indices.shape[0], device=nms_indices.device) < nms_valids, torch.zeros_like(nms_indices, dtype=torch.bool))
-            mask_data["keep_mask"] = torch.index_select(mask_data["keep_mask"], 0, nms_indices)
-            mask_data["masks"] = torch.index_select(mask_data["masks"], 0, nms_indices)
-            return mask_data["masks"], torch.logical_and(mask_data["keep_mask"], nms_mask)
+            image_batch = len(mask_data["nms_result_tuples"])
+            mask_batch = mask_data["keep_mask"].shape[0] // image_batch
+
+            mask_data["keep_mask"] = torch.stack(torch.split(mask_data["keep_mask"], mask_batch, dim=0), dim=0)
+            mask_data["masks"] = torch.stack(torch.split(mask_data["masks"], mask_batch, dim=0), dim=0)
+            nms_masks = []
+            for i in range(image_batch):
+                nms_indices = mask_data["nms_result_tuples"][i][0]
+                nms_valids = mask_data["nms_result_tuples"][i][1]
+                mask_data["keep_mask"][i] = torch.gather(mask_data["keep_mask"][i], 0, nms_indices)
+                mask_data["masks"][i] = torch.index_select(mask_data["masks"][i], 0, nms_indices)
+                nms_mask = torch.logical_or(torch.arange(nms_indices.shape[0], device=nms_indices.device) < nms_valids, torch.zeros_like(nms_indices, dtype=torch.bool))
+                nms_masks.append(nms_mask)
+            nms_masks = torch.stack(nms_masks,0)
+
+            return mask_data["masks"], torch.logical_and(mask_data["keep_mask"], nms_masks)
 
     def _generate_masks(self, image: torch.Tensor, multimask_output: bool = True) -> MaskData: # TODO: Rework for batch processing
         orig_size = image.shape[2:]
@@ -228,13 +238,20 @@ class SamAutomaticMaskGenerator:
 
         # Remove duplicates within this crop.
         with xp.Trace('batched_nms'):
-            data["nms_result_tuple"] = xf.nms(
-                boxes = data["boxes"].float(),
-                scores = data["iou_preds"],
-                score_threshold = torch.tensor(self.pred_iou_thresh, dtype=torch.float, device = xm.xla_device()),
-                iou_threshold = torch.tensor(self.box_nms_thresh, dtype=torch.float, device = xm.xla_device()),
-                output_size = data["boxes"].shape[0]
-            )
+            image_batch = cropped_im.shape[0]
+            mask_batch = data["boxes"].shape[0] // image_batch
+            results = []
+            for i in range(image_batch):
+                start = i * mask_batch
+                end = (i + 1) * mask_batch
+                results.append(xf.nms(
+                    boxes = data["boxes"][start:end].float(),
+                    scores = data["iou_preds"][start:end],
+                    score_threshold = torch.tensor(self.pred_iou_thresh, dtype=torch.float, device = xm.xla_device()),
+                    iou_threshold = torch.tensor(self.box_nms_thresh, dtype=torch.float, device = xm.xla_device()),
+                    output_size = mask_batch
+                ))
+            data["nms_result_tuples"] = results
 
         # Return to the original image frame
         with xp.Trace('uncrop_boxes'):

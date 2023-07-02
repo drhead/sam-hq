@@ -179,30 +179,32 @@ class MaskDecoderHQ(nn.Module):
         # sparse_prompt_embeddings:  torch.Size([16, 2, 256])
         # dense_prompt_embeddings:  torch.Size([16, 256, 64, 64])
         # hq_features:  torch.Size([2, 32, 256, 256])
+        def xla_repeat_interleave_bat(input, repeats, dim):
+            output = []
+            repeat_shape = tuple(1 if i != dim else repeats for i in range(input.dim()))
+            for i in range(input.size(dim)):
+                tensor = input[i].repeat(repeat_shape)
+                output.append(tensor)
+            return torch.cat(output, dim)
+        image_batch = image_embeddings.shape[0]
+        mask_batch = sparse_prompt_embeddings.shape[0]
+
+        sparse_prompt_embeddings = xla_repeat_interleave_bat(sparse_prompt_embeddings, image_batch, dim=0)
+        dense_prompt_embeddings = xla_repeat_interleave_bat(dense_prompt_embeddings, image_batch, dim=0)
+        image_pe = xla_repeat_interleave_bat(image_pe, image_batch, dim=0)
+
         output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight, self.hf_token.weight], dim=0)
         output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
-        
-        def xla_repeat_interleave_bat(input, repeats, dim):
-            output = []
-            for i in range(input.size(0)):
-                tensor = input[i].unsqueeze(0)
-                shape = list(tensor.shape)
-                shape.insert(dim, repeats)
-                output.append(tensor.unsqueeze(dim + 1).expand(*shape).reshape(-1, *shape[2:]))
-            return torch.cat(output, dim=0)
 
         # Expand per-image data in batch direction to be per-mask
-        src = xla_repeat_interleave_bat(image_embeddings, tokens.shape[0], dim=0)
-        dpe = xla_repeat_interleave_bat(dense_prompt_embeddings, image_embeddings.shape[0], dim=0)
-        ipe = xla_repeat_interleave_bat(image_pe, image_embeddings.shape[0], dim=0)
-        tok = xla_repeat_interleave_bat(tokens, image_embeddings.shape[0], dim=0)
-        src = src + dpe
-        pos_src = xla_repeat_interleave_bat(ipe, tokens.shape[0], dim=0)
+        src = xla_repeat_interleave_bat(image_embeddings, mask_batch, dim=0)
+        src = src + dense_prompt_embeddings
+        pos_src = xla_repeat_interleave_bat(image_pe, mask_batch, dim=0)
         b, c, h, w = src.shape
 
         # Run the transformer
-        hs, src = self.transformer(src, pos_src, tok)
+        hs, src = self.transformer(src, pos_src, tokens, image_batch)
         iou_token_out = hs[:, 0, :]
         mask_tokens_out = hs[:, 1 : (1 + self.num_mask_tokens), :]
         
@@ -210,7 +212,7 @@ class MaskDecoderHQ(nn.Module):
         src = src.transpose(1, 2).view(b, c, h, w)
 
         upscaled_embedding_sam = self.output_upscaling(src)
-        upscaled_embedding_hq = self.embedding_maskfeature(upscaled_embedding_sam) + hq_features.repeat((b // image_embeddings.shape[0]),1,1,1)
+        upscaled_embedding_hq = self.embedding_maskfeature(upscaled_embedding_sam) + hq_features.repeat((b // image_batch),1,1,1)
         hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):
             if i < self.num_mask_tokens - 1:

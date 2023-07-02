@@ -28,7 +28,7 @@ import pickle
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
 
 def trace_fn():
-    time.sleep(90)
+    time.sleep(120)
     print('++++++++ START OF PROFILING ++++++++')
     xp.trace(
         'localhost:6009', 
@@ -64,8 +64,8 @@ def _mp_fn(index):
     sam_dynamo = torch.compile(sam, backend='torchxla_trace_once')
     mask_generator = SamAutomaticMaskGenerator(
         model=sam_dynamo, # type: ignore
-        points_per_side=4,
-        points_per_batch=16
+        points_per_side=8,
+        points_per_batch=64
     )
 
     print(f"[xla:{xm.get_ordinal()}] model loaded")
@@ -102,27 +102,27 @@ def _mp_fn(index):
             transform=HWCtoCHWTransform())
     
     dataset = SERIAL_EXEC.run(lambda: load_dataset())
-    train_sampler = DistributedSampler(
+    generation_sampler = DistributedSampler(
         dataset,
         num_replicas=xm.xrt_world_size(),
         rank=xm.get_ordinal(),
         shuffle=False)
     dataloader = DataLoader(
         dataset,
-        batch_size=2, 
-        sampler=train_sampler, 
+        batch_size=1, 
+        sampler=generation_sampler, 
         num_workers=0)
-    train_loader = pl.MpDeviceLoader(dataloader,device)
+    generation_loader = pl.MpDeviceLoader(dataloader,device)
 
     print(f"[xla:{xm.get_ordinal()}] dataset loaded")
     tracker = xm.RateTracker()
 
     # Main processing loop
-    for batch_idx, (input) in enumerate(train_loader):
-        masks, valid = mask_generator.generate(input, multimask_output=False)
+    for batch_idx, (input) in enumerate(generation_loader):
+        masks, valid = mask_generator.generate(input)
         tracker.add(1)
         print(f"[xla:{xm.get_ordinal()}] batch {batch_idx}, got {valid.count_nonzero()} masks. Rate {tracker.rate()}, global {tracker.global_rate()}")
 if __name__ == '__main__':
     if trace: p.start()
     # _mp_fn(1)
-    xmp.spawn(_mp_fn, args=(), nprocs=1, start_method='spawn')
+    xmp.spawn(_mp_fn, args=(), start_method='spawn')
