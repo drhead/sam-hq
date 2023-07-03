@@ -38,7 +38,7 @@ def trace_fn():
         timeout_s=15, 
         duration_ms=30000)
     print('++++++++  END OF PROFILING  ++++++++')
-trace = True
+trace = False
 p = multiprocessing.Process(target=trace_fn)
 
 SERIAL_EXEC = xmp.MpSerialExecutor()
@@ -83,11 +83,11 @@ def _mp_fn(index):
         def __getitem__(self, idx):
             img_path = os.path.join(self.img_dir, self.file_list[idx])
             image = cv2.imread(img_path)
-            # print(img_path)
+            filename = self.file_list[idx]
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             if self.transform:
                 image = self.transform(image)
-            return image
+            return image, filename
     
     class HWCtoCHWTransform():
         def __call__(self, img):
@@ -116,12 +116,43 @@ def _mp_fn(index):
 
     print(f"[xla:{xm.get_ordinal()}] dataset loaded")
     tracker = xm.RateTracker()
+    from PIL import Image
 
     # Main processing loop
-    for batch_idx, (input) in enumerate(generation_loader):
+    for batch_idx, (input, filename) in enumerate(generation_loader):
         masks, valid = mask_generator.generate(input)
         tracker.add(1)
-        print(f"[xla:{xm.get_ordinal()}] batch {batch_idx}, got {valid.count_nonzero()} masks. Rate {tracker.rate()}, global {tracker.global_rate()}")
+        validcount = valid.to(torch.int8).count_nonzero().cpu().item()
+        print(f"[xla:{xm.get_ordinal()}] batch {batch_idx}, got {validcount} masks. Rate {tracker.rate()}, global {tracker.global_rate()}")
+
+        # Convolution operation for postprocessing masks
+        with xp.Trace('postprocess_conv'):
+            if validcount > 0:
+                random_index = torch.randint(0, int(validcount), (1,))
+                kernel = torch.tensor(
+                    [[[[0,1,1,1,0],
+                       [1,1,1,1,1],
+                       [1,1,1,1,1],
+                       [1,1,1,1,1],
+                       [0,1,1,1,0]]]],
+                    dtype=torch.bool, 
+                    device=xm.xla_device()
+                )
+                mask_convolving = masks[0][random_index]
+                mask_convolving = ~mask_convolving
+                for i in range(1): # Erode for one step to clean up areas
+                    mask_convolving = torch.nn.functional.conv2d(mask_convolving, kernel, padding=(2,2))
+                mask_convolving = ~mask_convolving
+                for i in range(6): # Dilate for 10 steps to simulate inpainting style mask
+                    mask_convolving = torch.nn.functional.conv2d(mask_convolving, kernel, padding=(2,2))
+            else:
+                mask_convolving = torch.ones_like(masks[0][0].unsqueeze(0), device=xm.xla_device())
+            mask_convolving = mask_convolving.squeeze(0).squeeze(0)
+            mask_convolving = torch.where(mask_convolving, torch.tensor(255, dtype=torch.int8, device=xm.xla_device()), torch.tensor(0, dtype=torch.int8, device=xm.xla_device()))
+            image = Image.fromarray(mask_convolving.cpu().numpy(), mode='L')
+            image.save(os.path.join('./data/out_masks/', filename[0]))
+
+
 if __name__ == '__main__':
     if trace: p.start()
     # _mp_fn(1)
