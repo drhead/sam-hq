@@ -49,6 +49,7 @@ class SamAutomaticMaskGenerator:
         crop_n_points_downscale_factor: int = 1,
         point_grids: Optional[List[np.ndarray]] = None,
         min_mask_region_area: int = 0,
+        min_mask_size: int = 0,
     ) -> None:
         """
         Using a SAM model, generates masks for the entire image.
@@ -89,6 +90,8 @@ class SamAutomaticMaskGenerator:
           min_mask_region_area (int): If >0, postprocessing will be applied
             to remove disconnected regions and holes in masks with area smaller
             than min_mask_region_area. Requires opencv.
+          min_mask_size (int): If >0, masks will not be considered valid unless
+            their total pixel area exceeds min_mask_size.
         """
 
         assert (points_per_side is None) != (
@@ -119,9 +122,10 @@ class SamAutomaticMaskGenerator:
         self.crop_overlap_ratio = crop_overlap_ratio
         self.crop_n_points_downscale_factor = crop_n_points_downscale_factor
         self.min_mask_region_area = min_mask_region_area
+        self.min_mask_size = min_mask_size
 
     @torch.no_grad()
-    def generate(self, image: torch.Tensor, multimask_output: bool = True) -> Tuple[torch.Tensor, torch.Tensor]: # TODO: Rework for batch processing
+    def generate(self, image: torch.Tensor, multimask_output: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # TODO: Rework for batch processing
         """
         Generates masks for the given image.
 
@@ -147,34 +151,34 @@ class SamAutomaticMaskGenerator:
         """
 
         # Generate masks
-        with xp.StepTrace('generate_masks'):
-            mask_data = self._generate_masks(image, multimask_output)
+        
+        mask_data = self._generate_masks(image, multimask_output)
 
             # Filter small disconnected regions and holes in masks
-            if self.min_mask_region_area > 0:
-                print("WARN: Skipping postprocessing (bypassed pending refactor)")
+        if self.min_mask_region_area > 0:
+            print("WARN: Skipping postprocessing (bypassed pending refactor)")
                 # mask_data = self.postprocess_small_regions(
                 #     mask_data,
                 #     self.min_mask_region_area,
                 #     max(self.box_nms_thresh, self.crop_nms_thresh),
                 # )
-        with xp.Trace('data_export'):
-            image_batch = len(mask_data["nms_result_tuples"])
-            mask_batch = mask_data["keep_mask"].shape[0] // image_batch
+            # with xp.Trace('data_export'):
+            # image_batch = len(mask_data["nms_result_tuples"])
+            # mask_batch = mask_data["keep_mask"].shape[0] // image_batch
 
-            mask_data["keep_mask"] = torch.stack(torch.split(mask_data["keep_mask"], mask_batch, dim=0), dim=0)
-            mask_data["masks"] = torch.stack(torch.split(mask_data["masks"], mask_batch, dim=0), dim=0)
-            nms_masks = []
-            for i in range(image_batch):
-                nms_indices = mask_data["nms_result_tuples"][i][0]
-                nms_valids = mask_data["nms_result_tuples"][i][1]
-                mask_data["keep_mask"][i] = torch.gather(mask_data["keep_mask"][i], 0, nms_indices)
-                mask_data["masks"][i] = torch.index_select(mask_data["masks"][i], 0, nms_indices)
-                nms_mask = torch.logical_or(torch.arange(nms_indices.shape[0], device=nms_indices.device) < nms_valids, torch.zeros_like(nms_indices, dtype=torch.bool))
-                nms_masks.append(nms_mask)
-            nms_masks = torch.stack(nms_masks,0)
+            # mask_data["keep_mask"] = torch.stack(torch.split(mask_data["keep_mask"], mask_batch, dim=0), dim=0)
+            # mask_data["masks"] = torch.stack(torch.split(mask_data["masks"], mask_batch, dim=0), dim=0)
+            # nms_masks = []
+            # for i in range(image_batch):
+            #     nms_indices = mask_data["nms_result_tuples"][i][0]
+            #     nms_valids = mask_data["nms_result_tuples"][i][1]
+            #     mask_data["keep_mask"][i] = torch.gather(mask_data["keep_mask"][i], 0, nms_indices)
+            #     mask_data["masks"][i] = torch.index_select(mask_data["masks"][i], 0, nms_indices)
+            #     nms_mask = torch.logical_or(torch.arange(nms_indices.shape[0], device=nms_indices.device) < nms_valids, torch.zeros_like(nms_indices, dtype=torch.bool))
+            #     nms_masks.append(nms_mask)
+            # nms_masks = torch.stack(nms_masks,0)
 
-            return mask_data["masks"], torch.logical_and(mask_data["keep_mask"], nms_masks)
+        return mask_data["masks"], mask_data["valid_index"], mask_data["count"] # torch.logical_and(mask_data["keep_mask"], nms_masks)
 
     def _generate_masks(self, image: torch.Tensor, multimask_output: bool = True) -> MaskData: # TODO: Rework for batch processing
         orig_size = image.shape[2:]
@@ -236,23 +240,24 @@ class SamAutomaticMaskGenerator:
                 del batch_data
             self.predictor.reset_image()
 
+        # print(data["iou_preds"])
         # Remove duplicates within this crop.
         with xp.Trace('batched_nms'):
-            image_batch = cropped_im.shape[0]
-            mask_batch = data["boxes"].shape[0] // image_batch
-            results = []
-            for i in range(image_batch):
-                start = i * mask_batch
-                end = (i + 1) * mask_batch
-                results.append(xf.nms(
-                    boxes = data["boxes"][start:end].float(),
-                    scores = data["iou_preds"][start:end],
-                    score_threshold = torch.tensor(self.pred_iou_thresh, dtype=torch.float, device = xm.xla_device()),
-                    iou_threshold = torch.tensor(self.box_nms_thresh, dtype=torch.float, device = xm.xla_device()),
-                    output_size = mask_batch
-                ))
-            data["nms_result_tuples"] = results
-
+            # image_batch = cropped_im.shape[0]
+            # mask_batch = data["boxes"].shape[0] // image_batch
+            # results = []
+            # for i in range(image_batch):
+            #     start = i * mask_batch
+            #     end = (i + 1) * mask_batch
+            data["valid_index"], data["count"] = xf.nms(
+                boxes = data["boxes"].float(),
+                scores = data["iou_preds"],
+                score_threshold = torch.tensor(self.pred_iou_thresh, dtype=torch.float, device = xm.xla_device()),
+                iou_threshold = torch.tensor(self.box_nms_thresh, dtype=torch.float, device = xm.xla_device()),
+                output_size = self.points_per_batch
+            )
+            # data["nms_result_tuples"] = results
+        
         # Return to the original image frame
         with xp.Trace('uncrop_boxes'):
             data["boxes"] = uncrop_boxes_xyxy(data["boxes"], crop_box)
@@ -313,7 +318,16 @@ class SamAutomaticMaskGenerator:
         with xp.Trace('uncrop_masks'):
             data["masks"] = uncrop_masks(data["masks"], crop_box, orig_h, orig_w)
 
-        data["keep_mask"] = keep_mask
+        with xp.Trace('minimum_size'):
+            data["sizes"] = torch.sum(data["masks"], (1,2))
+            if self.min_mask_size > 0.0:
+                keep_mask = torch.logical_and(keep_mask, data["sizes"].to(torch.int32) > self.min_mask_size)
+
+        # data["keep_mask"] = keep_mask
+        # print(keep_mask.count_nonzero().to(torch.int8))
+        keep_mask = ~keep_mask
+        data["scores"] = data["iou_preds"]
+        data["scores"] -= keep_mask.to(torch.float) # subtract from the IoU scores to make NMS handle all of the filtering
 
         return data
 

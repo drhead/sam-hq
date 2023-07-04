@@ -122,9 +122,10 @@ class MaskDecoderHQ(nn.Module):
           torch.Tensor: batched predicted masks
           torch.Tensor: batched predictions of mask quality
         """
-        with xp.Trace('decoder_hq_forward'):
+        with xp.Trace('decoder_forward'):
             vit_features = interm_embeddings[0].permute(0, 3, 1, 2) # early-layer ViT feature, after 1st global attention block in ViT
-            hq_features = self.embedding_encoder(image_embeddings) + self.compress_vit_feat(vit_features)
+            with xp.Trace('decoder_hq_features'):
+                hq_features = self.embedding_encoder(image_embeddings) + self.compress_vit_feat(vit_features)
 
             masks, iou_pred = self.predict_masks(
                 image_embeddings=image_embeddings,
@@ -210,15 +211,18 @@ class MaskDecoderHQ(nn.Module):
         
         # Upscale mask embeddings and predict masks using the mask tokens
         src = src.transpose(1, 2).view(b, c, h, w)
-
-        upscaled_embedding_sam = self.output_upscaling(src)
-        upscaled_embedding_hq = self.embedding_maskfeature(upscaled_embedding_sam) + hq_features.repeat((b // image_batch),1,1,1)
+        with xp.Trace('decoder_output_upscaling'):
+            upscaled_embedding_sam = self.output_upscaling(src)
+        with xp.Trace('decoder_maskfeature'):
+            upscaled_embedding_hq = self.embedding_maskfeature(upscaled_embedding_sam) + hq_features.repeat((b // image_batch),1,1,1)
         hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):
             if i < self.num_mask_tokens - 1:
-                hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
+                with xp.Trace('decoder_hyper_mlp'):
+                    hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
             else:
-                hyper_in_list.append(self.hf_mlp(mask_tokens_out[:, i, :]))
+                with xp.Trace('decoder_hf_mlp'):
+                    hyper_in_list.append(self.hf_mlp(mask_tokens_out[:, i, :]))
 
         hyper_in = torch.stack(hyper_in_list, dim=1)
         b, c, h, w = upscaled_embedding_sam.shape
